@@ -183,198 +183,128 @@ def _concatenate_with_transitions(
     transition_sfx_track_id: Optional[int] = None,
 ) -> None:
     media_streams = []
+    max_audio_channels = 0
 
     for path in input_files:
-        duration, has_audio = _probe_media(path)
+        duration, audio_stream_count = _probe_media(path)
+        max_audio_channels = max(max_audio_channels, audio_stream_count)
+        
         media_input = ffmpeg.input(path)
-        audio_stream = media_input.audio if has_audio else _build_silence_audio(duration)
-        media_streams.append(
-            {
-                "video": media_input.video,
-                "audio": audio_stream,
-                "duration": duration,
-            }
-        )
+        streams = {"video": media_input.video, "duration": duration, "audio": []}
+        
+        # We'll collect all audio streams later in the loop to ensure we handle the max count
+        # But we need to store the input node to access streams by index
+        streams["input_node"] = media_input
+        streams["audio_count"] = audio_stream_count
+        media_streams.append(streams)
 
-    current_video = media_streams[0]["video"]
-    current_audio = media_streams[0]["audio"]
-    cumulative_duration = media_streams[0]["duration"]
-    trailing_clip_duration = media_streams[0]["duration"]
+    # Ensure we have at least 1 audio track if any input has audio, or if we need to add SFX
+    # If transition_sfx_track_id is set, ensure we have enough tracks
+    if transition_sfx_track_id is not None:
+        max_audio_channels = max(max_audio_channels, transition_sfx_track_id + 1)
     
-    # Collect SFX streams if they should go to a separate track
-    sfx_streams = []
-    total_duration_so_far = media_streams[0]["duration"]
+    # Default to 1 track if everything is silent but we might want audio
+    max_audio_channels = max(max_audio_channels, 1)
 
+    # Initialize current streams with the first clip
+    current_video = media_streams[0]["video"]
+    current_audio_tracks = []
+    
+    first_clip_duration = media_streams[0]["duration"]
+    
+    for t in range(max_audio_channels):
+        if t < media_streams[0]["audio_count"]:
+            current_audio_tracks.append(media_streams[0]["input_node"][f"a:{t}"])
+        else:
+            current_audio_tracks.append(_build_silence_audio(first_clip_duration))
+
+    cumulative_duration = first_clip_duration
+    trailing_clip_duration = first_clip_duration
+    
     for idx in range(1, len(media_streams)):
-        next_stream = media_streams[idx]
+        next_stream_data = media_streams[idx]
         transition_key = transition_plan[idx - 1]
         effective_duration = _effective_transition_duration(
             transition_duration,
             trailing_clip_duration,
-            next_stream["duration"],
+            next_stream_data["duration"],
         )
         offset = max(cumulative_duration - effective_duration, 0)
+
+        # Prepare next audio tracks (pad with silence if needed)
+        next_audio_tracks = []
+        for t in range(max_audio_channels):
+            if t < next_stream_data["audio_count"]:
+                next_audio_tracks.append(next_stream_data["input_node"][f"a:{t}"])
+            else:
+                next_audio_tracks.append(_build_silence_audio(next_stream_data["duration"]))
 
         if transition_key == "whip_pan":
             current_video = _apply_whip_pan_transition(
                 current_video,
-                next_stream["video"],
+                next_stream_data["video"],
                 effective_duration,
                 offset,
             )
-            if transition_sfx_track_id is not None:
-                # SFX goes to separate track - just crossfade main audio
-                current_audio = ffmpeg.filter(
-                    [current_audio, next_stream["audio"]],
-                    "acrossfade",
-                    d=effective_duration,
-                )
-                # Collect SFX stream for separate track
-                sfx_stream = _build_whip_pan_sound_effect(offset, effective_duration, whip_pan_sfx_gain_db)
-                if sfx_stream is not None:
-                    sfx_streams.append({"stream": sfx_stream, "offset": offset})
-            else:
-                # Mix SFX into main audio (original behavior)
-                current_audio = _apply_whip_pan_audio(
-                    current_audio,
-                    next_stream["audio"],
-                    effective_duration,
-                    offset,
-                    whip_pan_sfx_gain_db,
-                )
+            
+            # Apply audio transitions for each track
+            for t in range(max_audio_channels):
+                # Check if this track should get the SFX
+                # If transition_sfx_track_id is None, it goes to track 0 (default behavior)
+                should_add_sfx = (transition_sfx_track_id == t) or (transition_sfx_track_id is None and t == 0)
+                
+                if should_add_sfx:
+                    current_audio_tracks[t] = _apply_whip_pan_audio(
+                        current_audio_tracks[t],
+                        next_audio_tracks[t],
+                        effective_duration,
+                        offset,
+                        whip_pan_sfx_gain_db,
+                    )
+                else:
+                    # Standard crossfade for other tracks
+                    current_audio_tracks[t] = ffmpeg.filter(
+                        [current_audio_tracks[t], next_audio_tracks[t]],
+                        "acrossfade",
+                        d=effective_duration,
+                    )
+                    
         else:
             transition_name = SUPPORTED_TRANSITION_TYPES[transition_key]
             if transition_name is None:
                 raise ValueError("transition plan unexpectedly requested 'none'.")
             current_video = ffmpeg.filter(
-                [current_video, next_stream["video"]],
+                [current_video, next_stream_data["video"]],
                 "xfade",
                 transition=transition_name,
                 duration=effective_duration,
                 offset=offset,
             )
-            current_audio = ffmpeg.filter(
-                [current_audio, next_stream["audio"]],
-                "acrossfade",
-                d=effective_duration,
-            )
+            
+            # Apply standard crossfade to all audio tracks
+            for t in range(max_audio_channels):
+                current_audio_tracks[t] = ffmpeg.filter(
+                    [current_audio_tracks[t], next_audio_tracks[t]],
+                    "acrossfade",
+                    d=effective_duration,
+                )
 
-        cumulative_duration = cumulative_duration + next_stream["duration"] - effective_duration
-        trailing_clip_duration = next_stream["duration"]
-        total_duration_so_far = cumulative_duration
+        cumulative_duration = cumulative_duration + next_stream_data["duration"] - effective_duration
+        trailing_clip_duration = next_stream_data["duration"]
 
     output_kwargs = {"vcodec": "libx264", "pix_fmt": "yuv420p", "movflags": "faststart"}
-
-    stream = None
-    if current_audio is not None:
+    
+    # Build output streams list: Video + All Audio Tracks
+    output_streams = [current_video]
+    
+    # Add audio codec if we have audio
+    if current_audio_tracks:
         output_kwargs["acodec"] = "aac"
-        
-        if transition_sfx_track_id is not None and sfx_streams:
-            # Build separate SFX track by mixing all SFX streams with silence base
-            sfx_track = _build_sfx_track(sfx_streams, cumulative_duration, AUDIO_SAMPLE_RATE)
-            
-            # Use ffmpeg.merge_outputs to combine video+main audio with sfx audio
-            # This creates two output specs that share the same filter graph
-            video_audio_output = ffmpeg.output(
-                current_video, current_audio, output_path,
-                **output_kwargs
-            )
-            
-            # Get the compiled command to see the filter graph
-            cmd = video_audio_output.compile()
-            
-            # Find filter_complex and add SFX track to it
-            filter_idx = None
-            for i, arg in enumerate(cmd):
-                if arg == "-filter_complex":
-                    filter_idx = i
-                    break
-            
-            if filter_idx is not None:
-                # Compile SFX track to get its filter part
-                sfx_output = ffmpeg.output(sfx_track, "/dev/null", format="null")
-                sfx_cmd = sfx_output.compile()
-                
-                # Find SFX filter_complex
-                sfx_filter_idx = None
-                for i, arg in enumerate(sfx_cmd):
-                    if arg == "-filter_complex":
-                        sfx_filter_idx = i
-                        break
-                
-                if sfx_filter_idx is not None:
-                    main_filter = cmd[filter_idx + 1]
-                    sfx_filter = sfx_cmd[sfx_filter_idx + 1]
-                    
-                    # Rename ALL labels in SFX filter to avoid conflicts
-                    # Replace [s0], [s1], [s2], etc. with [sfx0], [sfx1], [sfx2], etc.
-                    def rename_sfx_label(match):
-                        return f"[sfx{match.group(1)}]"
-                    sfx_filter_renamed = re.sub(r'\[s(\d+)\]', rename_sfx_label, sfx_filter)
-                    
-                    # Also rename input references [0:a], [1:a] etc. to use the anullsrc input
-                    # The SFX filter should only use the anullsrc input which is already in its filter
-                    
-                    # Find the final output label (should now be [sfx0] or similar)
-                    final_sfx_label_match = re.search(r'\[sfx\d+\]$', sfx_filter_renamed)
-                    if final_sfx_label_match:
-                        final_sfx_label = final_sfx_label_match.group(0)
-                        # Rename the final output to just [sfx]
-                        sfx_filter_renamed = sfx_filter_renamed[:-len(final_sfx_label)] + "[sfx]"
-                    else:
-                        # If no match, just append [sfx] at the end
-                        sfx_filter_renamed = sfx_filter_renamed.rstrip(";") + "[sfx]"
-                    
-                    # Combine filters
-                    combined_filter = f"{main_filter};{sfx_filter_renamed}"
-                    
-                    # Rebuild command with multi-track output
-                    new_cmd = ["ffmpeg", "-y"]
-                    
-                    # Add all inputs (skip ffmpeg itself)
-                    i = 1
-                    while i < filter_idx:
-                        new_cmd.append(cmd[i])
-                        i += 1
-                    
-                    # Add combined filter
-                    new_cmd.extend(["-filter_complex", combined_filter])
-                    
-                    # Find the actual output labels from the main filter
-                    # Look for the last [sN] labels that would be video and audio outputs
-                    main_labels = re.findall(r'\[s\d+\]', main_filter)
-                    if len(main_labels) >= 2:
-                        # Last two labels should be video and main audio
-                        video_label = main_labels[-2] if len(main_labels) >= 2 else "[s0]"
-                        audio_label = main_labels[-1]
-                    else:
-                        video_label = "[s0]"
-                        audio_label = "[s1]" if len(main_labels) >= 1 else "[s0]"
-                    
-                    # Map outputs
-                    new_cmd.extend(["-map", video_label])  # video
-                    new_cmd.extend(["-map", audio_label])  # main audio
-                    new_cmd.extend(["-map", "[sfx]"])  # sfx
-                    
-                    # Add output options
-                    new_cmd.extend(["-vcodec", output_kwargs.get("vcodec", "libx264")])
-                    new_cmd.extend(["-pix_fmt", output_kwargs.get("pix_fmt", "yuv420p")])
-                    new_cmd.extend(["-movflags", output_kwargs.get("movflags", "faststart")])
-                    new_cmd.extend(["-c:a", output_kwargs.get("acodec", "aac")])
-                    new_cmd.append(output_path)
-                    
-                    result = subprocess.run(new_cmd, capture_output=True, text=True)
-                    if result.returncode != 0:
-                        raise RuntimeError(f"FFmpeg multi-track output failed: {result.stderr}")
-                    return
-            
-            # Fallback if we couldn't build multi-track command
-            stream = video_audio_output
-        else:
-            stream = ffmpeg.output(current_video, current_audio, output_path, **output_kwargs)
-    else:
-        stream = ffmpeg.output(current_video, output_path, **output_kwargs)
+        output_streams.extend(current_audio_tracks)
 
+    # Map all streams to output
+    # Note: ffmpeg-python handles the mapping automatically when multiple streams are passed to output()
+    stream = ffmpeg.output(*output_streams, filename=output_path, **output_kwargs)
     stream.run(overwrite_output=True)
 
 
@@ -566,7 +496,7 @@ def _effective_transition_duration(
     return effective
 
 
-def _probe_media(path: str) -> Tuple[float, bool]:
+def _probe_media(path: str) -> Tuple[float, int]:
     try:
         probe = ffmpeg.probe(path)
     except ffmpeg.Error as exc:
@@ -577,8 +507,8 @@ def _probe_media(path: str) -> Tuple[float, bool]:
         raise ValueError(f"Unable to determine duration for {path}.")
 
     duration = float(duration_str)
-    has_audio = any(stream.get("codec_type") == "audio" for stream in probe.get("streams", []))
-    return duration, has_audio
+    audio_stream_count = sum(1 for stream in probe.get("streams", []) if stream.get("codec_type") == "audio")
+    return duration, audio_stream_count
 
 
 def _build_silence_audio(duration: float):
