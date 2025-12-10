@@ -8,6 +8,7 @@ services:
     volumes:
       - storage:/app/storage
       - logs:/app/logs
+      - D:/yt_shorts/video_queue:/data/video_queue
     restart: unless-stopped
     depends_on:
       - minio
@@ -46,7 +47,9 @@ services:
       - nca-network
 
   n8n:
-    image: docker.n8n.io/n8nio/n8n
+    build:
+      context: .
+      dockerfile: Dockerfile.n8n
     restart: unless-stopped
     ports:
       - "5678:5678"
@@ -58,9 +61,14 @@ services:
       - WEBHOOK_URL=http://localhost:5678/
       - GENERIC_TIMEZONE=UTC
       - N8N_SECURE_COOKIE=false
+      - N8N_PAYLOAD_SIZE_MAX=268435456
+      - NODE_FUNCTION_ALLOW_BUILTIN=http,https
+      - NODE_FUNCTION_ALLOW_EXTERNAL=@aws-sdk/client-s3,@aws-sdk/s3-request-presigner
     volumes:
       - n8n_data:/home/node/.n8n
       - ./local-files:/files
+      - ./fonts:/fonts
+      - D:/yt_shorts/video_queue:/data/video_queue
     networks:
       - nca-network
 

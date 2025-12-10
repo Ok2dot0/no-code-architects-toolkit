@@ -109,7 +109,8 @@ def process_ffmpeg_compose(data, job_id):
     # Add inputs
     input_paths = []
     download_cache = {}  # cache of url -> local_path
-    for input_data in data["inputs"]:
+    audio_track_mappings = []  # Track audio_track_id assignments for later mapping
+    for input_index, input_data in enumerate(data["inputs"]):
         if "options" in input_data:
             for option in input_data["options"]:
                 command.append(option["option"])
@@ -123,11 +124,18 @@ def process_ffmpeg_compose(data, job_id):
             download_cache[file_url] = input_path
         input_paths.append(input_path)
         command.extend(["-i", input_path])
+        
+        # Track audio_track_id if specified
+        if "audio_track_id" in input_data:
+            audio_track_mappings.append({
+                "input_index": input_index,
+                "track_id": input_data["audio_track_id"]
+            })
     
     # Add filters
     subtitles_paths = []  # Track downloaded subtitles/filter files
+    user_filters = []
     if data.get("filters"):
-        new_filters = []
         for filter_obj in data["filters"]:
             filter_str = filter_obj["filter"]
             def replace_url(match):
@@ -148,8 +156,46 @@ def process_ffmpeg_compose(data, job_id):
             # Regex: (.*?)(subtitles|ass)=(['"])(https?://[^'\"]+)(['"])(.*)
             pattern = r"(.*?)(subtitles|ass)=([\'\"])(https?://[^'\"]+)([\'\"])(.*)"
             filter_str = re.sub(pattern, replace_url, filter_str)
-            new_filters.append(filter_str)
-        filter_complex = ";".join(new_filters)
+            user_filters.append(filter_str)
+    
+    # Build audio track mapping filters if audio_track_id is specified
+    audio_track_filters = []
+    audio_track_labels = []
+    if audio_track_mappings:
+        # Find the max track_id to determine total number of output audio tracks
+        max_track_id = max(m["track_id"] for m in audio_track_mappings)
+        
+        # Create a dict mapping track_id -> list of input indices
+        track_to_inputs = {}
+        for mapping in audio_track_mappings:
+            track_id = mapping["track_id"]
+            input_idx = mapping["input_index"]
+            if track_id not in track_to_inputs:
+                track_to_inputs[track_id] = []
+            track_to_inputs[track_id].append(input_idx)
+        
+        # Generate filter chains for each track
+        for track_id in range(max_track_id + 1):
+            if track_id in track_to_inputs:
+                input_indices = track_to_inputs[track_id]
+                if len(input_indices) == 1:
+                    # Single input for this track - just label it
+                    input_idx = input_indices[0]
+                    audio_track_filters.append(f"[{input_idx}:a]anull[atrack{track_id}]")
+                else:
+                    # Multiple inputs for this track - mix them together
+                    input_labels = "".join(f"[{idx}:a]" for idx in input_indices)
+                    audio_track_filters.append(f"{input_labels}amix=inputs={len(input_indices)}:dropout_transition=0[atrack{track_id}]")
+                audio_track_labels.append(f"[atrack{track_id}]")
+            else:
+                # No input for this track - create silence
+                audio_track_filters.append(f"anullsrc=channel_layout=stereo:sample_rate=48000[atrack{track_id}]")
+                audio_track_labels.append(f"[atrack{track_id}]")
+    
+    # Combine user filters with audio track filters
+    all_filters = user_filters + audio_track_filters
+    if all_filters:
+        filter_complex = ";".join(all_filters)
         command.extend(["-filter_complex", filter_complex])
     
     # Add outputs
@@ -163,6 +209,11 @@ def process_ffmpeg_compose(data, job_id):
         extension = get_extension_from_format(format_name) if format_name else 'mp4'
         output_filename = os.path.join(LOCAL_STORAGE_PATH, f"{job_id}_output_{i}.{extension}")
         output_filenames.append(output_filename)
+        
+        # Add audio track mappings if we generated them
+        if audio_track_labels:
+            for label in audio_track_labels:
+                command.extend(["-map", label])
         
         for option in output["options"]:
             command.append(option["option"])

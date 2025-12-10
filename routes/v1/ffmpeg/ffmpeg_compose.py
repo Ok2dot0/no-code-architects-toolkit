@@ -48,6 +48,12 @@ logger = logging.getLogger(__name__)
                             },
                             "required": ["option"]
                         }
+                    },
+                    "audio_track_id": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 15,
+                        "description": "Audio track index (0-15) to assign this input's audio to in the output"
                     }
                 },
                 "required": ["file_url"]

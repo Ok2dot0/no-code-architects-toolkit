@@ -24,6 +24,7 @@ The request body should be a JSON object with the following properties:
   - `options` (optional, array): An array of option objects, each containing:
     - `option` (required, string): The FFmpeg option.
     - `argument` (optional, string, number, or null): The argument for the option.
+  - `audio_track_id` (optional, integer, 0-15): Assigns this input's audio to a specific audio track index in the output. When multiple inputs use the same `audio_track_id`, their audio is mixed together. Tracks without assigned inputs get silence.
 - `filters` (optional, array): An array of filter objects, each containing:
   - `filter` (required, string): The FFmpeg filter.
 - `outputs` (required, array): An array of output option objects, each containing:
@@ -243,3 +244,83 @@ The main application context (`app.py`) includes error handling for the processi
 - Monitor the queue length and adjust the maximum queue length as needed to prevent overloading the system.
 - Implement retry mechanisms for handling failed webhook deliveries or other transient errors.
 - Use unique and descriptive `id` values for each request to aid in troubleshooting and monitoring.
+
+## 9. Multi-Track Audio Example (n8n)
+
+The `audio_track_id` parameter allows you to assign audio from different inputs to separate audio tracks in the output. This is useful for post-processing workflows where you want to control the mix of different audio sources later.
+
+### Example: Combining Video with Background Music on Separate Tracks
+
+This example places the video's original audio on track 0 and background music on track 1:
+
+```json
+{
+  "inputs": [
+    {
+      "file_url": "{{ $json.video_url }}",
+      "audio_track_id": 0
+    },
+    {
+      "file_url": "{{ $json.background_music_url }}",
+      "audio_track_id": 1
+    }
+  ],
+  "outputs": [
+    {
+      "options": [
+        {"option": "-map", "argument": "0:v:0"},
+        {"option": "-c:v", "argument": "copy"},
+        {"option": "-c:a", "argument": "aac"}
+      ]
+    }
+  ]
+}
+```
+
+### n8n HTTP Request Node Configuration
+
+```json
+{
+  "method": "POST",
+  "url": "https://your-api.com/v1/ffmpeg/compose",
+  "headers": {
+    "x-api-key": "{{ $env.NCA_API_KEY }}",
+    "Content-Type": "application/json"
+  },
+  "body": {
+    "inputs": [
+      {
+        "file_url": "{{ $json.video_url }}",
+        "audio_track_id": 0
+      },
+      {
+        "file_url": "{{ $json.voiceover_url }}",
+        "audio_track_id": 1
+      },
+      {
+        "file_url": "{{ $json.sfx_url }}",
+        "audio_track_id": 2
+      }
+    ],
+    "outputs": [
+      {
+        "options": [
+          {"option": "-map", "argument": "0:v:0"},
+          {"option": "-c:v", "argument": "copy"},
+          {"option": "-c:a", "argument": "aac"},
+          {"option": "-shortest"}
+        ]
+      }
+    ],
+    "webhook_url": "{{ $env.WEBHOOK_URL }}",
+    "id": "{{ $json.job_id }}"
+  }
+}
+```
+
+This creates an output video with:
+- Track 0: Original video audio
+- Track 1: Voiceover
+- Track 2: Sound effects
+
+You can then use `/v1/audio/merge_tracks` to combine all tracks with proper loudness normalization.
