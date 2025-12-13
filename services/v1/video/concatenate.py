@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 import tempfile
+import uuid
 from typing import List, Tuple, Optional
 
 import ffmpeg
@@ -205,21 +206,54 @@ def _concatenate_with_transitions(
     
     # Default to 1 track if everything is silent but we might want audio
     max_audio_channels = max(max_audio_channels, 1)
+    
+    # Determine which track gets crossfade + SFX (main audio track)
+    sfx_target_track = 0 if transition_sfx_track_id is None else transition_sfx_track_id
 
     # Initialize current streams with the first clip
     current_video = media_streams[0]["video"]
-    current_audio_tracks = []
+    
+    # For the SFX track: will be crossfaded during transitions
+    # For non-SFX tracks: collect all segments and concatenate at the end (no overlap)
+    current_sfx_audio = None  # The crossfaded SFX track
+    concat_audio_segments = [[] for _ in range(max_audio_channels)]  # For concatenation
     
     first_clip_duration = media_streams[0]["duration"]
     
     for t in range(max_audio_channels):
         if t < media_streams[0]["audio_count"]:
-            current_audio_tracks.append(media_streams[0]["input_node"][f"a:{t}"])
+            audio_stream = media_streams[0]["input_node"][f"a:{t}"]
         else:
-            current_audio_tracks.append(_build_silence_audio(first_clip_duration))
+            audio_stream = _build_silence_audio(first_clip_duration)
+        
+        if t == sfx_target_track:
+            # SFX track: will be crossfaded
+            current_sfx_audio = audio_stream
+        else:
+            # Other tracks: collect for concatenation
+            concat_audio_segments[t].append(audio_stream)
 
     cumulative_duration = first_clip_duration
     trailing_clip_duration = first_clip_duration
+    
+    # Count whip_pan transitions to pre-split SFX
+    whip_pan_count = sum(1 for t in transition_plan if t == "whip_pan")
+    
+    # Pre-split the SFX file if we have whip_pan transitions and the file exists
+    sfx_splits = []
+    if whip_pan_count > 0 and os.path.exists(WHIP_PAN_SFX_PATH):
+        sfx_input = ffmpeg.input(WHIP_PAN_SFX_PATH).audio
+        if whip_pan_count == 1:
+            sfx_splits = [sfx_input]
+        else:
+            # Use asplit to create multiple copies of the SFX stream
+            sfx_split_node = sfx_input.filter_multi_output("asplit", outputs=whip_pan_count)
+            sfx_splits = [sfx_split_node.stream(i) for i in range(whip_pan_count)]
+    
+    sfx_split_index = 0
+    
+    # Collect SFX streams to mix at the end (avoids deep amix chains)
+    sfx_streams_to_mix = []
     
     for idx in range(1, len(media_streams)):
         next_stream_data = media_streams[idx]
@@ -231,13 +265,24 @@ def _concatenate_with_transitions(
         )
         offset = max(cumulative_duration - effective_duration, 0)
 
-        # Prepare next audio tracks (pad with silence if needed)
-        next_audio_tracks = []
+        # Process each audio track
         for t in range(max_audio_channels):
             if t < next_stream_data["audio_count"]:
-                next_audio_tracks.append(next_stream_data["input_node"][f"a:{t}"])
+                next_audio = next_stream_data["input_node"][f"a:{t}"]
             else:
-                next_audio_tracks.append(_build_silence_audio(next_stream_data["duration"]))
+                # Fill missing tracks with silence matching the clip duration
+                next_audio = _build_silence_audio(next_stream_data["duration"])
+            
+            if t == sfx_target_track:
+                # SFX track: crossfade with transition
+                current_sfx_audio = ffmpeg.filter(
+                    [current_sfx_audio, next_audio],
+                    "acrossfade",
+                    d=effective_duration,
+                )
+            else:
+                # Other tracks: collect for simple concatenation (no crossfade)
+                concat_audio_segments[t].append(next_audio)
 
         if transition_key == "whip_pan":
             current_video = _apply_whip_pan_transition(
@@ -247,27 +292,17 @@ def _concatenate_with_transitions(
                 offset,
             )
             
-            # Apply audio transitions for each track
-            for t in range(max_audio_channels):
-                # Check if this track should get the SFX
-                # If transition_sfx_track_id is None, it goes to track 0 (default behavior)
-                should_add_sfx = (transition_sfx_track_id == t) or (transition_sfx_track_id is None and t == 0)
-                
-                if should_add_sfx:
-                    current_audio_tracks[t] = _apply_whip_pan_audio(
-                        current_audio_tracks[t],
-                        next_audio_tracks[t],
-                        effective_duration,
-                        offset,
-                        whip_pan_sfx_gain_db,
-                    )
-                else:
-                    # Standard crossfade for other tracks
-                    current_audio_tracks[t] = ffmpeg.filter(
-                        [current_audio_tracks[t], next_audio_tracks[t]],
-                        "acrossfade",
-                        d=effective_duration,
-                    )
+            # Collect SFX stream to mix at the end (use pre-split streams)
+            if sfx_split_index < len(sfx_splits):
+                sfx_stream = _build_whip_pan_sound_effect_from_stream(
+                    sfx_splits[sfx_split_index],
+                    offset,
+                    effective_duration,
+                    whip_pan_sfx_gain_db,
+                )
+                sfx_split_index += 1
+                if sfx_stream is not None:
+                    sfx_streams_to_mix.append(sfx_stream)
                     
         else:
             transition_name = SUPPORTED_TRANSITION_TYPES[transition_key]
@@ -280,17 +315,40 @@ def _concatenate_with_transitions(
                 duration=effective_duration,
                 offset=offset,
             )
-            
-            # Apply standard crossfade to all audio tracks
-            for t in range(max_audio_channels):
-                current_audio_tracks[t] = ffmpeg.filter(
-                    [current_audio_tracks[t], next_audio_tracks[t]],
-                    "acrossfade",
-                    d=effective_duration,
-                )
 
         cumulative_duration = cumulative_duration + next_stream_data["duration"] - effective_duration
         trailing_clip_duration = next_stream_data["duration"]
+    
+    # Mix all SFX streams into the SFX audio track at the end
+    if sfx_streams_to_mix:
+        streams_to_mix = [current_sfx_audio] + sfx_streams_to_mix
+        current_sfx_audio = ffmpeg.filter(
+            streams_to_mix,
+            "amix",
+            inputs=len(streams_to_mix),
+            duration="first",
+            dropout_transition=0,
+            normalize=0,
+        )
+    
+    # Build the final audio tracks
+    final_audio_tracks = []
+    for t in range(max_audio_channels):
+        if t == sfx_target_track:
+            # SFX track is already crossfaded and mixed
+            final_audio_tracks.append(current_sfx_audio)
+        else:
+            # Concatenate all segments for this track (simple sequential append)
+            segments = concat_audio_segments[t]
+            if len(segments) == 1:
+                final_audio_tracks.append(segments[0])
+            elif len(segments) > 1:
+                # Use concat filter to join all audio segments sequentially
+                concatenated = ffmpeg.concat(*segments, v=0, a=1).node[0]
+                final_audio_tracks.append(concatenated)
+            else:
+                # No segments, shouldn't happen but add silence just in case
+                final_audio_tracks.append(_build_silence_audio(cumulative_duration))
 
     output_kwargs = {"vcodec": "libx264", "pix_fmt": "yuv420p", "movflags": "faststart"}
     
@@ -298,9 +356,9 @@ def _concatenate_with_transitions(
     output_streams = [current_video]
     
     # Add audio codec if we have audio
-    if current_audio_tracks:
+    if final_audio_tracks:
         output_kwargs["acodec"] = "aac"
-        output_streams.extend(current_audio_tracks)
+        output_streams.extend(final_audio_tracks)
 
     # Map all streams to output
     # Note: ffmpeg-python handles the mapping automatically when multiple streams are passed to output()
@@ -330,37 +388,32 @@ def _apply_whip_pan_transition(
     return ffmpeg.filter([sharp, blurred], "blend", all_expr=blend_expr)
 
 
-def _apply_whip_pan_audio(
-    leading_audio,
-    trailing_audio,
-    transition_duration: float,
-    offset: float,
-    gain_db: float,
-):
-    base_audio = ffmpeg.filter(
-        [leading_audio, trailing_audio],
-        "acrossfade",
-        d=transition_duration,
-    )
-
-    effect_stream = _build_whip_pan_sound_effect(offset, transition_duration, gain_db)
-    if effect_stream is None:
-        return base_audio
-
-    return ffmpeg.filter(
-        [base_audio, effect_stream],
-        "amix",
-        inputs=2,
-        dropout_transition=0,
-    )
-
-
 def _build_whip_pan_sound_effect(offset: float, duration: float, gain_db: float):
     if not os.path.exists(WHIP_PAN_SFX_PATH):
         return None
 
+    # ffmpeg-python creates new nodes each time input() is called
     effect = ffmpeg.input(WHIP_PAN_SFX_PATH).audio
     trimmed = effect.filter_(
+        "atrim",
+        start=0,
+        duration=duration,
+    ).filter_("asetpts", "PTS-STARTPTS")
+
+    if gain_db != 0:
+        linear_gain = math.pow(10.0, gain_db / 20.0)
+        trimmed = trimmed.filter_("volume", linear_gain)
+
+    delay_ms = max(int(round(offset * 1000)), 0)
+    if delay_ms > 0:
+        trimmed = trimmed.filter_("adelay", f"{delay_ms}|{delay_ms}")
+
+    return trimmed
+
+
+def _build_whip_pan_sound_effect_from_stream(sfx_stream, offset: float, duration: float, gain_db: float):
+    """Build whip pan SFX from a pre-split stream to avoid ffmpeg-python node caching issues."""
+    trimmed = sfx_stream.filter_(
         "atrim",
         start=0,
         duration=duration,
@@ -512,11 +565,13 @@ def _probe_media(path: str) -> Tuple[float, int]:
 
 
 def _build_silence_audio(duration: float):
+    # Generate silence using aevalsrc with unique timestamp to avoid node caching.
+    # Using aevalsrc '0' generates silence which is more reliable than anullsrc
+    # when we need multiple independent silence streams.
+    unique_ts = uuid.uuid4().hex[:8]
     silence = ffmpeg.input(
-        "anullsrc",
+        f"aevalsrc=0:c=stereo:s={AUDIO_SAMPLE_RATE}:d={duration}",
         f="lavfi",
-        channel_layout="stereo",
-        sample_rate=AUDIO_SAMPLE_RATE,
     ).audio
 
-    return silence.filter_("atrim", duration=duration).filter_("asetpts", "N/SR/TB")
+    return silence.filter_("asetpts", "N/SR/TB")

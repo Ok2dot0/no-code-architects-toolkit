@@ -4,6 +4,7 @@
 .env
 *.pyc
 services/__pycache__/file_management.cpython-310.pyc
+tests/__pycache__/
+services/v1/video/__pycache__/
+local-files/
 .gitignore
-tests/__pycache__/*
-services/v1/video/__pycache__/*
